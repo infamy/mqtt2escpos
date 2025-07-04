@@ -36,3 +36,6 @@ go.work.sum
 tests/
 *.tmp
 *.log
+
+# MacOS
+.DS_Store
