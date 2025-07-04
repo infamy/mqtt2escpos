@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Test scripts and temporary files
+tests/
+*.tmp
+*.log
