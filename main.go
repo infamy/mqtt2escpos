@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"errors"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/gosixtyfive/escpos"
 )
@@ -62,10 +64,24 @@ func NewPrinterClient(config Config) *PrinterClient {
 
 // Connect establishes connection to the printer
 func (pc *PrinterClient) Connect() error {
+	// Close existing connection if any
+	if pc.conn != nil {
+		pc.conn.Close()
+		pc.conn = nil
+		pc.printer = nil
+	}
+
 	var err error
 	pc.conn, err = net.Dial("tcp", pc.config.PrinterHost+":"+pc.config.PrinterPort)
 	if err != nil {
 		return fmt.Errorf("failed to connect to printer: %v", err)
+	}
+
+	// Enable TCP keepalive to detect dead connections
+	if tcpConn, ok := pc.conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetLinger(0) // Don't wait on close
 	}
 
 	pc.printer = escpos.New(pc.conn)
@@ -111,8 +127,82 @@ func (pc *PrinterClient) decodeImage(imageData, format string) (image.Image, err
 	return img, nil
 }
 
-// Print processes a print job
+// isConnectionError checks if an error is likely due to a lost printer connection using error types only
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Unwrap and check for net.OpError
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		// Timeout or temporary errors are likely connection issues
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
+		}
+		// Check for syscall errors
+		var sysErr syscall.Errno
+		if errors.As(netErr.Err, &sysErr) {
+			switch sysErr {
+			case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.ENOTCONN, syscall.ETIMEDOUT:
+				return true
+			}
+		}
+	}
+	// Optionally, check for direct syscall errors
+	if errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		errors.Is(err, syscall.ETIMEDOUT) {
+		return true
+	}
+	return false
+}
+
+// checkConnectionHealth proactively checks if the printer connection is still alive
+func (pc *PrinterClient) checkConnectionHealth() error {
+	if pc.conn == nil {
+		return fmt.Errorf("printer not connected")
+	}
+
+	// Try to get the connection state
+	if pc.conn.RemoteAddr() == nil {
+		return fmt.Errorf("printer connection lost")
+	}
+
+	// Set a short timeout for the health check
+	pc.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	defer pc.conn.SetWriteDeadline(time.Time{}) // Clear the deadline
+
+	// Try to send a harmless ESC/POS command (line feed) to test the connection
+	_, err := pc.conn.Write([]byte{0x0A}) // Line feed character
+	if err != nil {
+		return fmt.Errorf("connection health check failed: %v", err)
+	}
+
+	return nil
+}
+
+// Print processes a print job with fresh connection for each job
 func (pc *PrinterClient) Print(job PrintJob) error {
+	// Reconnect before every print job to ensure fresh connection
+	log.Printf("Connecting to printer for print job...")
+	if err := pc.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to printer: %v", err)
+	}
+
+	// Print the job
+	err := pc.printJobInternal(job)
+	if err != nil {
+		log.Printf("Print job failed with error: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// printJobInternal contains the original print logic
+func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 	if pc.printer == nil {
 		return fmt.Errorf("printer not connected")
 	}
@@ -240,7 +330,10 @@ func (pc *PrinterClient) Print(job PrintJob) error {
 	pc.printer.Size(1, 1)
 
 	// Send to printer and cut
-	pc.printer.PrintAndCut()
+	if err := pc.printer.PrintAndCut(); err != nil {
+		log.Printf("Error during PrintAndCut: %v", err)
+		return fmt.Errorf("failed to send data to printer: %v", err)
+	}
 
 	log.Printf("Print job completed successfully")
 	return nil
