@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"errors"
-
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/gosixtyfive/escpos"
 )
@@ -465,62 +463,6 @@ func (pc *PrinterClient) decodeImage(imageData, format string) (image.Image, err
 	img = pc.applyDithering(img)
 
 	return img, nil
-}
-
-// isConnectionError checks if an error is likely due to a lost printer connection using error types only
-func isConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Unwrap and check for net.OpError
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		// Timeout or temporary errors are likely connection issues
-		if netErr.Timeout() || netErr.Temporary() {
-			return true
-		}
-		// Check for syscall errors
-		var sysErr syscall.Errno
-		if errors.As(netErr.Err, &sysErr) {
-			switch sysErr {
-			case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.ENOTCONN, syscall.ETIMEDOUT:
-				return true
-			}
-		}
-	}
-	// Optionally, check for direct syscall errors
-	if errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.ENOTCONN) ||
-		errors.Is(err, syscall.ETIMEDOUT) {
-		return true
-	}
-	return false
-}
-
-// checkConnectionHealth proactively checks if the printer connection is still alive
-func (pc *PrinterClient) checkConnectionHealth() error {
-	if pc.conn == nil {
-		return fmt.Errorf("printer not connected")
-	}
-
-	// Try to get the connection state
-	if pc.conn.RemoteAddr() == nil {
-		return fmt.Errorf("printer connection lost")
-	}
-
-	// Set a short timeout for the health check
-	pc.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	defer pc.conn.SetWriteDeadline(time.Time{}) // Clear the deadline
-
-	// Try to send a harmless ESC/POS command (line feed) to test the connection
-	_, err := pc.conn.Write([]byte{0x0A}) // Line feed character
-	if err != nil {
-		return fmt.Errorf("connection health check failed: %v", err)
-	}
-
-	return nil
 }
 
 // Print processes a print job with fresh connection for each job
