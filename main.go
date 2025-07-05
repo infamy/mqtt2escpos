@@ -40,6 +40,13 @@ type PrintJob struct {
 	ImageFormat string `json:"image_format,omitempty"` // "png", "jpeg", "gif"
 }
 
+// PrinterCommand represents printer control commands
+type PrinterCommand struct {
+	PrinterName string `json:"printer_name"`
+	Command     string `json:"command"`         // "feed", "cut", "feed_and_cut"
+	Lines       int    `json:"lines,omitempty"` // Number of lines to feed (for feed command)
+}
+
 // PrinterProfile defines printer capabilities and settings
 type PrinterProfile struct {
 	Name         string
@@ -172,6 +179,127 @@ func (pc *PrinterClient) Close() error {
 		return pc.conn.Close()
 	}
 	return nil
+}
+
+// Feed feeds paper by the specified number of lines
+func (pc *PrinterClient) Feed(lines int) error {
+	if pc.printer == nil {
+		return fmt.Errorf("printer not connected")
+	}
+
+	if lines <= 0 {
+		lines = 1 // Default to 1 line if not specified
+	}
+
+	log.Printf("Feeding paper by %d lines", lines)
+
+	for i := 0; i < lines; i++ {
+		pc.printer.LineFeed()
+	}
+
+	// Send the feed command to printer
+	if err := pc.printer.Print(); err != nil {
+		log.Printf("Error during feed: %v", err)
+		return fmt.Errorf("failed to feed paper: %v", err)
+	}
+
+	// Add delay to allow printer to process the feed command
+	time.Sleep(250 * time.Millisecond)
+
+	log.Printf("Paper feed completed successfully")
+	return nil
+}
+
+// Cut cuts the paper
+func (pc *PrinterClient) Cut() error {
+	if pc.printer == nil {
+		return fmt.Errorf("printer not connected")
+	}
+
+	log.Printf("Cutting paper")
+
+	// Send cut command to printer
+	log.Printf("Sending cut command to printer...")
+	bytesWritten, err := pc.printer.Cut()
+	if err != nil {
+		log.Printf("Error during cut: %v", err)
+		return fmt.Errorf("failed to cut paper: %v", err)
+	}
+	log.Printf("Cut command sent successfully, bytes written: %d", bytesWritten)
+
+	// Flush the cut command to ensure it's sent immediately
+	if err := pc.printer.Print(); err != nil {
+		log.Printf("Error flushing cut command: %v", err)
+		return fmt.Errorf("failed to flush cut command: %v", err)
+	}
+
+	// Add delay to allow printer to process the cut command
+	time.Sleep(500 * time.Millisecond)
+
+	log.Printf("Paper cut completed successfully")
+	return nil
+}
+
+// FeedAndCut feeds paper and then cuts it
+func (pc *PrinterClient) FeedAndCut(lines int) error {
+	if pc.printer == nil {
+		return fmt.Errorf("printer not connected")
+	}
+
+	log.Printf("Feeding and cutting paper")
+
+	// Feed the specified lines
+	if lines <= 0 {
+		lines = 1 // Default to 1 line if not specified
+	}
+
+	log.Printf("Feeding paper by %d lines", lines)
+
+	for i := 0; i < lines; i++ {
+		pc.printer.LineFeed()
+	}
+
+	// Send the feed command to printer
+	if err := pc.printer.Print(); err != nil {
+		log.Printf("Error during feed: %v", err)
+		return fmt.Errorf("failed to feed paper: %v", err)
+	}
+
+	// Add delay to allow printer to process the feed command
+	time.Sleep(250 * time.Millisecond)
+
+	// Add delay between feed and cut
+	time.Sleep(150 * time.Millisecond)
+
+	// Then cut (which will add 5 more lines before cutting)
+	if err := pc.Cut(); err != nil {
+		return err
+	}
+
+	log.Printf("Feed and cut completed successfully")
+	return nil
+}
+
+// ExecuteCommand executes a printer command
+func (pc *PrinterClient) ExecuteCommand(cmd PrinterCommand) error {
+	// Reconnect before every command to ensure fresh connection
+	log.Printf("Connecting to printer for command execution...")
+	if err := pc.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to printer: %v", err)
+	}
+
+	log.Printf("Executing printer command: %s", cmd.Command)
+
+	switch strings.ToLower(cmd.Command) {
+	case "feed":
+		return pc.Feed(cmd.Lines)
+	case "cut":
+		return pc.Cut()
+	case "feed_and_cut":
+		return pc.FeedAndCut(cmd.Lines)
+	default:
+		return fmt.Errorf("unknown printer command: %s", cmd.Command)
+	}
 }
 
 // resizeImage resizes an image to fit within printer limits using proper scaling
@@ -455,6 +583,40 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 		pc.printer.Size(1, 1)
 	}
 
+	// Print image if specified (at the top, after title)
+	if job.Image != "" {
+		log.Printf("Processing image for printing")
+
+		// Determine image format
+		format := job.ImageFormat
+		if format == "" {
+			// Try to detect format from base64 data or default to PNG
+			format = "png"
+		}
+
+		// Decode the image
+		img, err := pc.decodeImage(job.Image, format)
+		if err != nil {
+			log.Printf("Error decoding image: %v", err)
+			pc.printer.Write("Error: Failed to decode image")
+			pc.printer.LineFeed()
+		} else {
+			// Print the image
+			_, err = pc.printer.PrintImage(img)
+			if err != nil {
+				log.Printf("Error printing image: %v", err)
+				pc.printer.Write("Error: Failed to print image")
+				pc.printer.LineFeed()
+			} else {
+				log.Printf("Image printed successfully")
+				pc.printer.LineFeed()
+
+				// Add extra delay after image printing to ensure it's fully processed
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+	}
+
 	// Set justification for message
 	switch job.Justify {
 	case "center":
@@ -504,48 +666,38 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 		pc.printer.LineFeed()
 	}
 
-	// Print image if specified
-	if job.Image != "" {
-		log.Printf("Processing image for printing")
-
-		// Determine image format
-		format := job.ImageFormat
-		if format == "" {
-			// Try to detect format from base64 data or default to PNG
-			format = "png"
-		}
-
-		// Decode the image
-		img, err := pc.decodeImage(job.Image, format)
-		if err != nil {
-			log.Printf("Error decoding image: %v", err)
-			pc.printer.Write("Error: Failed to decode image")
-			pc.printer.LineFeed()
-		} else {
-			// Print the image
-			_, err = pc.printer.PrintImage(img)
-			if err != nil {
-				log.Printf("Error printing image: %v", err)
-				pc.printer.Write("Error: Failed to print image")
-				pc.printer.LineFeed()
-			} else {
-				log.Printf("Image printed successfully")
-				pc.printer.LineFeed()
-			}
-		}
-	}
-
 	// Reset formatting
 	pc.printer.Bold(false)
 	pc.printer.Underline(0)
 	pc.printer.Justify(escpos.JustifyLeft)
 	pc.printer.Size(1, 1)
 
-	// Send to printer and cut
-	if err := pc.printer.PrintAndCut(); err != nil {
-		log.Printf("Error during PrintAndCut: %v", err)
+	// Send to printer (without cutting)
+	if err := pc.printer.Print(); err != nil {
+		log.Printf("Error during print: %v", err)
 		return fmt.Errorf("failed to send data to printer: %v", err)
 	}
+
+	// Calculate delay based on content type and size
+	var delay time.Duration
+	if job.Image != "" {
+		// For images, calculate delay based on image data size
+		imageSize := len(job.Image)
+		if imageSize > 100000 { // Large image (>100KB)
+			delay = 1500 * time.Millisecond
+		} else if imageSize > 50000 { // Medium image (>50KB)
+			delay = 1 * time.Second
+		} else { // Small image
+			delay = 500 * time.Millisecond
+		}
+		log.Printf("Image size: %d bytes, using delay: %v", imageSize, delay)
+	} else {
+		// For text, use shorter delay
+		delay = 250 * time.Millisecond
+	}
+
+	// Add delay to allow printer to process the print job
+	time.Sleep(delay)
 
 	log.Printf("Print job completed successfully")
 	return nil
@@ -602,6 +754,31 @@ func (mc *MQTTClient) Subscribe() error {
 func (mc *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
 	log.Printf("Received message on topic %s: %s", msg.Topic(), string(msg.Payload()))
 
+	// Parse message to check if it contains an image
+	var tempJob PrintJob
+	if err := json.Unmarshal(msg.Payload(), &tempJob); err == nil && tempJob.Image != "" {
+		// For messages with images, use longer delay
+		time.Sleep(250 * time.Millisecond)
+	} else {
+		// For other messages, use shorter delay
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Try to parse as a printer command first
+	var cmd PrinterCommand
+	if err := json.Unmarshal(msg.Payload(), &cmd); err == nil && cmd.Command != "" {
+		// This is a printer command
+		if cmd.PrinterName == "" {
+			log.Printf("Warning: printer_name not specified in command")
+		}
+
+		if err := mc.printer.ExecuteCommand(cmd); err != nil {
+			log.Printf("Error executing printer command: %v", err)
+		}
+		return
+	}
+
+	// Try to parse as a print job
 	var job PrintJob
 	if err := json.Unmarshal(msg.Payload(), &job); err != nil {
 		log.Printf("Error parsing JSON message: %v", err)
