@@ -287,22 +287,63 @@ mode: single
 
 This project can also be used as a Home Assistant add-on. The add-on files are included in the root of this repository.
 
-### Installation
+### Installation as Local Add-on
 
-1. Copy or clone this repository into your Home Assistant `addons` folder (or add to a custom add-on repository).
-2. In Home Assistant, go to **Settings > Add-ons > Add-on Store** and click the three dots (⋮) > **Repositories**. Add your repository if needed.
-3. Find "MQTT to ESC/POS Printer Bridge" and install it.
-4. Configure the add-on options as needed in the UI.
-5. Start the add-on and check the logs for status.
+1. **Copy the Repository**: Copy this entire folder to your Home Assistant `addons` directory:
+   ```bash
+   # If using Samba or SSH access to your Home Assistant instance
+   cp -r /path/to/mqtt2escpos /path/to/homeassistant/addons/
+   ```
+   
+   The typical add-ons directory locations are:
+   - **Home Assistant OS**: `/addons/` (accessible via Samba or SSH)
+   - **Home Assistant Supervised**: `/usr/share/hassio/addons/local/`
+   - **Docker**: Mounted volume containing add-ons
+
+2. **Refresh Add-ons**: In Home Assistant:
+   - Go to **Settings > Add-ons > Add-on Store**
+   - Click the **Update** button (🔄) in the top right corner
+   - This will refresh the add-on list and show your local add-ons
+
+3. **Install the Add-on**:
+   - Look for "MQTT to ESC/POS Printer Bridge" in the **Local Add-ons** section
+   - Click on it and then click **Install**
+   - Wait for the installation to complete
+
+4. **Configure and Start**:
+   - Click **Configuration** to set up your MQTT broker and printer settings
+   - Click **Start** to run the add-on
+   - Check the **Logs** tab to verify it's running correctly
 
 ### Configuration Options
 
-See `config.yaml` for all available options and defaults.
+The add-on can be configured through the Home Assistant UI with these options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mqtt_broker` | `core-mosquitto` | MQTT broker address (use `core-mosquitto` for Home Assistant's built-in broker) |
+| `mqtt_username` | (empty) | MQTT username (leave empty if no authentication) |
+| `mqtt_password` | (empty) | MQTT password (leave empty if no authentication) |
+| `mqtt_topic` | `printer/commands` | MQTT topic to listen for print commands |
+| `printer_host` | `192.168.7.25` | Your printer's IP address |
+| `printer_port` | `9100` | Printer port (usually 9100 for network printers) |
+| `printer_profile` | `TM-T88VI` | Printer model profile |
+| `image_timeout` | `30` | Timeout for image processing (seconds) |
+| `max_image_size` | `1048576` | Maximum image size in bytes (1MB default) |
 
 ### How it works
 
-- The add-on builds and runs the Go-based MQTT to ESC/POS bridge inside a Home Assistant add-on container.
-- All configuration is passed via environment variables from the add-on options.
-- The add-on uses the same MQTT and printer settings as the standalone app.
+- The add-on builds and runs the Go-based MQTT to ESC/POS bridge inside a Home Assistant add-on container
+- All configuration is passed via environment variables from the add-on options
+- The add-on uses the same MQTT and printer settings as the standalone app
+- It automatically connects to your MQTT broker and listens for print commands
+- All the Home Assistant examples above work exactly the same with the add-on
 
-For advanced usage, troubleshooting, and support, see the rest of this README and the add-on files in this repository.
+### Troubleshooting
+
+- **Add-on not appearing**: Make sure you copied the entire folder and clicked the Update button
+- **Connection issues**: Check that your printer IP and port are correct
+- **MQTT issues**: Verify your MQTT broker settings and credentials
+- **Logs**: Always check the add-on logs for detailed error messages
+
+For advanced usage and support, see the rest of this README.
