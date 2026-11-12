@@ -1,6 +1,6 @@
 name: "MQTT to ESC/POS Printer Bridge"
 description: "Bridge MQTT messages to ESC/POS thermal printers for Home Assistant integration"
-version: "0.0.1"
+version: "0.0.2"
 icon: "icon.png"
 slug: "mqtt2escpos"
 arch:
@@ -11,6 +11,9 @@ arch:
   - i386
 startup: services
 init: false
+watchdog: "http://[HOST]:[PORT:8099]/health"
+services:
+  - mqtt:want
 options:
   mqtt_broker: "core-mosquitto"
   mqtt_username: ""

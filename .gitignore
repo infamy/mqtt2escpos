@@ -7,8 +7,9 @@
 *.dll
 *.so
 *.dylib
-escpos
-main
+/app/escpos
+/app/main
+/app/mqtt2escpos
 
 # Test binary, built with `go test -c`
 *.test

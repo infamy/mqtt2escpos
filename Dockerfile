@@ -24,3 +24,6 @@ COPY run.sh /
 RUN chmod a+x /run.sh
 
 CMD [ "/run.sh" ] 
+# Health check: healthy when connected to MQTT and subscribed
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8099/health > /dev/null || exit 1

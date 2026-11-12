@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,9 +13,12 @@ import (
 	"image/png"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -117,6 +121,7 @@ type Config struct {
 	PrinterProfile string // Printer profile to use
 	ImageTimeout   time.Duration
 	MaxImageSize   int
+	HealthAddr     string // listen address for the HTTP health endpoint ("" disables it)
 }
 
 // PrinterClient handles the printer connection and printing
@@ -647,9 +652,10 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 
 // MQTTClient handles MQTT communication
 type MQTTClient struct {
-	client  mqtt.Client
-	config  Config
-	printer *PrinterClient
+	client     mqtt.Client
+	config     Config
+	printer    *PrinterClient
+	subscribed atomic.Bool
 }
 
 // NewMQTTClient creates a new MQTT client
@@ -660,36 +666,113 @@ func NewMQTTClient(config Config, printer *PrinterClient) *MQTTClient {
 	}
 }
 
-// Connect establishes MQTT connection
-func (mc *MQTTClient) Connect() error {
+// brokerURL normalises the configured broker address, adding the default
+// MQTT port when none is given (e.g. "core-mosquitto" -> "tcp://core-mosquitto:1883").
+func brokerURL(broker string) string {
+	if !strings.Contains(broker, "://") {
+		broker = "tcp://" + broker
+	}
+	scheme, host, _ := strings.Cut(broker, "://")
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		port := "1883"
+		if scheme == "ssl" || scheme == "tls" || scheme == "mqtts" {
+			port = "8883"
+		}
+		host = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + host
+}
+
+// Connect starts the MQTT connection. It does not block: the client keeps
+// retrying in the background until the broker is reachable, and (re)subscribes
+// every time a connection is established. This lets the bridge start before the
+// broker is up (e.g. on a fresh Home Assistant boot) and survive broker restarts.
+func (mc *MQTTClient) Connect() {
+	broker := brokerURL(mc.config.MQTTBroker)
+
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker(mc.config.MQTTBroker)
+	opts.AddBroker(broker)
 	opts.SetUsername(mc.config.MQTTUsername)
 	opts.SetPassword(mc.config.MQTTPassword)
 	opts.SetClientID("mqtt2escpos-" + fmt.Sprintf("%d", time.Now().Unix()))
 	opts.SetAutoReconnect(true)
+	opts.SetMaxReconnectInterval(30 * time.Second)
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(5 * time.Second)
+	opts.SetConnectTimeout(10 * time.Second)
+
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
+		log.Printf("Connected to MQTT broker at %s", broker)
+		// Subscribe on every (re)connect: with a clean session the broker
+		// forgets our subscription whenever the connection drops.
+		go func() {
+			if err := mc.Subscribe(); err != nil {
+				log.Printf("Error: %v", err)
+			}
+		}()
+	})
+	opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
+		mc.subscribed.Store(false)
+		log.Printf("Lost connection to MQTT broker: %v (will reconnect)", err)
+	})
+	opts.SetReconnectingHandler(func(c mqtt.Client, o *mqtt.ClientOptions) {
+		log.Printf("Reconnecting to MQTT broker at %s...", broker)
+	})
+	opts.SetConnectionAttemptHandler(func(b *url.URL, cfg *tls.Config) *tls.Config {
+		log.Printf("Attempting MQTT connection to %s", b.String())
+		return cfg
+	})
 
 	mc.client = mqtt.NewClient(opts)
-
-	if token := mc.client.Connect(); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to connect to MQTT broker: %v", token.Error())
-	}
-
-	log.Printf("Connected to MQTT broker at %s", mc.config.MQTTBroker)
-	return nil
+	mc.client.Connect() // non-blocking with ConnectRetry; OnConnect handles the rest
 }
 
 // Subscribe subscribes to the print topic
 func (mc *MQTTClient) Subscribe() error {
 	token := mc.client.Subscribe(mc.config.MQTTTopic, 0, mc.messageHandler)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to subscribe to topic %s: %v", mc.config.MQTTTopic, token.Error())
+	if !token.WaitTimeout(10 * time.Second) {
+		return fmt.Errorf("timed out subscribing to topic %s", mc.config.MQTTTopic)
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("failed to subscribe to topic %s: %v", mc.config.MQTTTopic, err)
 	}
 
+	mc.subscribed.Store(true)
 	log.Printf("Subscribed to MQTT topic: %s", mc.config.MQTTTopic)
 	return nil
+}
+
+// Healthy reports whether the bridge is connected to the broker and subscribed.
+func (mc *MQTTClient) Healthy() bool {
+	return mc.client != nil && mc.client.IsConnectionOpen() && mc.subscribed.Load()
+}
+
+// startHealthServer serves GET /health: 200 when MQTT is connected and
+// subscribed, 503 otherwise. Used by the Supervisor watchdog and Docker HEALTHCHECK.
+func startHealthServer(addr string, mc *MQTTClient) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		status := map[string]any{
+			"mqtt_connected":  mc.client != nil && mc.client.IsConnectionOpen(),
+			"mqtt_subscribed": mc.subscribed.Load(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if mc.Healthy() {
+			status["status"] = "ok"
+			w.WriteHeader(http.StatusOK)
+		} else {
+			status["status"] = "unhealthy"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(status)
+	})
+
+	go func() {
+		log.Printf("Health endpoint listening on %s/health", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("Health endpoint stopped: %v", err)
+		}
+	}()
 }
 
 // messageHandler processes incoming MQTT messages
@@ -760,6 +843,7 @@ func getConfig() Config {
 		PrinterProfile: getEnv("PRINTER_PROFILE", "TM-T88VI"),
 		ImageTimeout:   30 * time.Second,
 		MaxImageSize:   1024 * 1024, // 1MB
+		HealthAddr:     getEnv("HEALTH_ADDR", ":8099"),
 	}
 }
 
@@ -782,28 +866,19 @@ func main() {
 	log.Printf("  Printer Profile: %s", config.PrinterProfile)
 	log.Printf("  Max Image Size: %d bytes", config.MaxImageSize)
 
-	// Create printer client
+	// Create printer client. We don't connect here: every job opens a fresh
+	// connection, and failing hard at startup (printer asleep, network not up
+	// yet on boot) would just crash the add-on.
 	printer := NewPrinterClient(config)
-
-	// Connect to printer
-	if err := printer.Connect(); err != nil {
-		log.Fatalf("Failed to connect to printer: %v", err)
-	}
 	defer printer.Close()
 
-	// Create MQTT client
+	// Connect to MQTT broker (retries in the background until it's available)
 	mqttClient := NewMQTTClient(config, printer)
-
-	// Connect to MQTT broker
-	if err := mqttClient.Connect(); err != nil {
-		log.Fatalf("Failed to connect to MQTT broker: %v", err)
+	if config.HealthAddr != "" {
+		startHealthServer(config.HealthAddr, mqttClient)
 	}
+	mqttClient.Connect()
 	defer mqttClient.Disconnect()
-
-	// Subscribe to print topic
-	if err := mqttClient.Subscribe(); err != nil {
-		log.Fatalf("Failed to subscribe to MQTT topic: %v", err)
-	}
 
 	log.Println("MQTT to ESC/POS bridge is running. Press Ctrl+C to exit.")
 
