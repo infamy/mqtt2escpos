@@ -16,6 +16,9 @@ PRINTER_PORT=$(bashio::config 'printer_port')
 PRINTER_PROFILE=$(bashio::config 'printer_profile')
 IMAGE_TIMEOUT=$(bashio::config 'image_timeout')
 MAX_IMAGE_SIZE=$(bashio::config 'max_image_size')
+HA_DISCOVERY=$(bashio::config 'ha_discovery')
+STATUS_INTERVAL=$(bashio::config 'status_interval')
+ADDON_VERSION=$(bashio::addon.version)
 
 export MQTT_BROKER
 export MQTT_USERNAME
@@ -26,6 +29,9 @@ export PRINTER_PORT
 export PRINTER_PROFILE
 export IMAGE_TIMEOUT
 export MAX_IMAGE_SIZE
+export HA_DISCOVERY
+export STATUS_INTERVAL
+export ADDON_VERSION
 
 bashio::log.info "Starting MQTT to ESC/POS Printer Bridge"
 bashio::log.info "MQTT Broker: $MQTT_BROKER"

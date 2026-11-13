@@ -17,7 +17,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -59,12 +61,14 @@ type PrinterProfile struct {
 	Threshold    int     // Grayscale threshold (0-255)
 	UseDithering bool    // Whether to use dithering
 	DitherMatrix [][]int // Dithering matrix
+	EscposConfig escpos.PrinterConfig
 }
 
 // Common printer profiles
 var PrinterProfiles = map[string]PrinterProfile{
 	"TM-T20II": {
 		Name:         "TM-T20II",
+		EscposConfig: escpos.ConfigEpsonTMT20II, // supports upside-down printing
 		MaxWidth:     384,
 		MaxHeight:    1024,
 		DefaultWidth: 384,
@@ -80,6 +84,7 @@ var PrinterProfiles = map[string]PrinterProfile{
 	},
 	"TM-T88III": {
 		Name:         "TM-T88III",
+		EscposConfig: escpos.ConfigEpsonTMT20II, // supports upside-down printing
 		MaxWidth:     512,
 		MaxHeight:    1024,
 		DefaultWidth: 512,
@@ -95,6 +100,7 @@ var PrinterProfiles = map[string]PrinterProfile{
 	},
 	"TM-T88VI": {
 		Name:         "TM-T88VI",
+		EscposConfig: escpos.ConfigEpsonTMT20II, // supports upside-down printing
 		MaxWidth:     576,
 		MaxHeight:    1024,
 		DefaultWidth: 576,
@@ -118,14 +124,19 @@ type Config struct {
 	MQTTTopic      string
 	PrinterHost    string
 	PrinterPort    string
-	PrinterProfile string // Printer profile to use
-	ImageTimeout   time.Duration
-	MaxImageSize   int
-	HealthAddr     string // listen address for the HTTP health endpoint ("" disables it)
+	PrinterProfile string        // Printer profile to use
+	ImageTimeout   time.Duration // write deadline for jobs containing an image
+	MaxImageSize   int           // maximum size of the base64 image payload, in bytes
+	HealthAddr     string        // listen address for the HTTP health endpoint ("" disables it)
+	ClientID       string        // fixed MQTT client ID so the broker keeps our session
+	HADiscovery    bool          // publish Home Assistant MQTT discovery configs
+	StatusInterval time.Duration // how often to poll the printer status
+	Version        string
 }
 
 // PrinterClient handles the printer connection and printing
 type PrinterClient struct {
+	mu      sync.Mutex // one printer connection at a time (jobs and status polls)
 	config  Config
 	conn    net.Conn
 	printer *escpos.Escpos
@@ -157,7 +168,7 @@ func (pc *PrinterClient) Connect() error {
 	}
 
 	var err error
-	pc.conn, err = net.Dial("tcp", pc.config.PrinterHost+":"+pc.config.PrinterPort)
+	pc.conn, err = net.DialTimeout("tcp", pc.addr(), 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to printer: %v", err)
 	}
@@ -166,22 +177,29 @@ func (pc *PrinterClient) Connect() error {
 	if tcpConn, ok := pc.conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetLinger(0) // Don't wait on close
 	}
 
 	pc.printer = escpos.New(pc.conn)
-	pc.printer.SetConfig(escpos.ConfigEpsonTMT20II)
+	pc.printer.SetConfig(pc.profile.EscposConfig)
 
 	log.Printf("Connected to printer at %s:%s using profile: %s", pc.config.PrinterHost, pc.config.PrinterPort, pc.profile.Name)
 	return nil
 }
 
-// Close closes the printer connection
+func (pc *PrinterClient) addr() string {
+	return net.JoinHostPort(pc.config.PrinterHost, pc.config.PrinterPort)
+}
+
+// Close closes the printer connection. Many network printers accept only one
+// connection at a time, so we close after every job rather than holding it open.
 func (pc *PrinterClient) Close() error {
-	if pc.conn != nil {
-		return pc.conn.Close()
+	if pc.conn == nil {
+		return nil
 	}
-	return nil
+	err := pc.conn.Close()
+	pc.conn = nil
+	pc.printer = nil
+	return err
 }
 
 // Feed feeds paper by the specified number of lines
@@ -285,11 +303,16 @@ func (pc *PrinterClient) FeedAndCut(lines int) error {
 
 // ExecuteCommand executes a printer command
 func (pc *PrinterClient) ExecuteCommand(cmd PrinterCommand) error {
-	// Reconnect before every command to ensure fresh connection
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// Fresh connection for every command
 	log.Printf("Connecting to printer for command execution...")
 	if err := pc.Connect(); err != nil {
-		return fmt.Errorf("failed to connect to printer: %v", err)
+		return err
 	}
+	defer pc.Close()
+	pc.conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	log.Printf("Executing printer command: %s", cmd.Command)
 
@@ -432,12 +455,6 @@ func (pc *PrinterClient) applyDithering(img image.Image) image.Image {
 
 // decodeImage decodes a base64 encoded image string with improved processing
 func (pc *PrinterClient) decodeImage(imageData, format string) (image.Image, error) {
-	// Check image data size
-	dataSize := len(imageData)
-	if dataSize > pc.config.MaxImageSize {
-		log.Printf("Warning: Image data size (%d bytes) exceeds maximum (%d bytes)", dataSize, pc.config.MaxImageSize)
-	}
-
 	// Decode base64 data
 	data, err := base64.StdEncoding.DecodeString(imageData)
 	if err != nil {
@@ -472,11 +489,26 @@ func (pc *PrinterClient) decodeImage(imageData, format string) (image.Image, err
 
 // Print processes a print job with fresh connection for each job
 func (pc *PrinterClient) Print(job PrintJob) error {
-	// Reconnect before every print job to ensure fresh connection
+	if len(job.Image) > pc.config.MaxImageSize {
+		return fmt.Errorf("image is %d bytes, larger than max_image_size (%d bytes); job rejected",
+			len(job.Image), pc.config.MaxImageSize)
+	}
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// Fresh connection for every job
 	log.Printf("Connecting to printer for print job...")
 	if err := pc.Connect(); err != nil {
-		return fmt.Errorf("failed to connect to printer: %v", err)
+		return err
 	}
+	defer pc.Close()
+
+	timeout := 15 * time.Second
+	if job.Image != "" {
+		timeout = pc.config.ImageTimeout
+	}
+	pc.conn.SetDeadline(time.Now().Add(timeout))
 
 	// Print the job
 	err := pc.printJobInternal(job)
@@ -498,7 +530,7 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 	if job.Title != "" {
 		log.Printf("Title: %s", job.Title)
 	}
-	log.Printf("Message: %s", job.Message)
+	log.Printf("Message: %s", truncate(job.Message, 200))
 
 	// Configure text formatting
 	if job.Bold {
@@ -656,6 +688,7 @@ type MQTTClient struct {
 	config     Config
 	printer    *PrinterClient
 	subscribed atomic.Bool
+	refresh    chan struct{} // asks the status poller to check the printer now
 }
 
 // NewMQTTClient creates a new MQTT client
@@ -663,6 +696,7 @@ func NewMQTTClient(config Config, printer *PrinterClient) *MQTTClient {
 	return &MQTTClient{
 		config:  config,
 		printer: printer,
+		refresh: make(chan struct{}, 1),
 	}
 }
 
@@ -694,7 +728,16 @@ func (mc *MQTTClient) Connect() {
 	opts.AddBroker(broker)
 	opts.SetUsername(mc.config.MQTTUsername)
 	opts.SetPassword(mc.config.MQTTPassword)
-	opts.SetClientID("mqtt2escpos-" + fmt.Sprintf("%d", time.Now().Unix()))
+	// A fixed client ID plus a persistent session (CleanSession=false) means the
+	// broker queues QoS 1 print jobs sent while we're restarting or reconnecting.
+	opts.SetClientID(mc.config.ClientID)
+	opts.SetCleanSession(false)
+	// Handle messages even if they arrive before Subscribe completes: queued
+	// messages are delivered right after connecting. We only subscribe to the
+	// print topic, so everything that arrives here is a print job or command.
+	opts.SetDefaultPublishHandler(mc.messageHandler)
+	// Broker marks us offline if we disappear without a clean disconnect.
+	opts.SetWill(topicBridgeStatus, "offline", 1, true)
 	opts.SetAutoReconnect(true)
 	opts.SetMaxReconnectInterval(30 * time.Second)
 	opts.SetConnectRetry(true)
@@ -703,12 +746,16 @@ func (mc *MQTTClient) Connect() {
 
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
 		log.Printf("Connected to MQTT broker at %s", broker)
-		// Subscribe on every (re)connect: with a clean session the broker
-		// forgets our subscription whenever the connection drops.
 		go func() {
+			mc.publish(topicBridgeStatus, "online", true)
+			if mc.config.HADiscovery {
+				mc.publishDiscovery()
+			}
+			// Subscribe on every (re)connect in case the broker lost our session.
 			if err := mc.Subscribe(); err != nil {
 				log.Printf("Error: %v", err)
 			}
+			mc.requestStatusRefresh()
 		}()
 	})
 	opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
@@ -729,7 +776,7 @@ func (mc *MQTTClient) Connect() {
 
 // Subscribe subscribes to the print topic
 func (mc *MQTTClient) Subscribe() error {
-	token := mc.client.Subscribe(mc.config.MQTTTopic, 0, mc.messageHandler)
+	token := mc.client.Subscribe(mc.config.MQTTTopic, 1, mc.messageHandler)
 	if !token.WaitTimeout(10 * time.Second) {
 		return fmt.Errorf("timed out subscribing to topic %s", mc.config.MQTTTopic)
 	}
@@ -777,7 +824,8 @@ func startHealthServer(addr string, mc *MQTTClient) {
 
 // messageHandler processes incoming MQTT messages
 func (mc *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
-	log.Printf("Received message on topic %s: %s", msg.Topic(), string(msg.Payload()))
+	log.Printf("Received %d-byte message on topic %s", len(msg.Payload()), msg.Topic())
+	defer mc.requestStatusRefresh()
 
 	// Parse message to check if it contains an image
 	var tempJob PrintJob
@@ -806,7 +854,7 @@ func (mc *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
 	// Try to parse as a print job
 	var job PrintJob
 	if err := json.Unmarshal(msg.Payload(), &job); err != nil {
-		log.Printf("Error parsing JSON message: %v", err)
+		log.Printf("Error parsing JSON message: %v (payload: %s)", err, truncate(string(msg.Payload()), 200))
 		return
 	}
 
@@ -827,12 +875,17 @@ func (mc *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
 // Disconnect disconnects from MQTT broker
 func (mc *MQTTClient) Disconnect() {
 	if mc.client != nil {
+		if mc.client.IsConnectionOpen() {
+			// A clean disconnect doesn't trigger the will, so mark ourselves offline.
+			mc.publish(topicBridgeStatus, "offline", true)
+		}
 		mc.client.Disconnect(250)
 	}
 }
 
 // getConfig loads configuration from environment variables
 func getConfig() Config {
+	hostname, _ := os.Hostname()
 	return Config{
 		MQTTBroker:     getEnv("MQTT_BROKER", "localhost:1883"),
 		MQTTUsername:   getEnv("MQTT_USERNAME", ""),
@@ -841,10 +894,30 @@ func getConfig() Config {
 		PrinterHost:    getEnv("PRINTER_HOST", "192.168.7.25"),
 		PrinterPort:    getEnv("PRINTER_PORT", "9100"),
 		PrinterProfile: getEnv("PRINTER_PROFILE", "TM-T88VI"),
-		ImageTimeout:   30 * time.Second,
-		MaxImageSize:   1024 * 1024, // 1MB
+		ImageTimeout:   time.Duration(getEnvInt("IMAGE_TIMEOUT", 30)) * time.Second,
+		MaxImageSize:   getEnvInt("MAX_IMAGE_SIZE", 1024*1024),
 		HealthAddr:     getEnv("HEALTH_ADDR", ":8099"),
+		ClientID:       getEnv("MQTT_CLIENT_ID", "mqtt2escpos-"+hostname),
+		HADiscovery:    getEnv("HA_DISCOVERY", "true") == "true",
+		StatusInterval: time.Duration(getEnvInt("STATUS_INTERVAL", 60)) * time.Second,
+		Version:        getEnv("ADDON_VERSION", "dev"),
 	}
+}
+
+// getEnvInt gets a positive integer environment variable with fallback
+func getEnvInt(key string, fallback int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
+		return v
+	}
+	return fallback
+}
+
+// truncate shortens s for logging
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + fmt.Sprintf("... (%d bytes)", len(s))
 }
 
 // getEnv gets environment variable with fallback
@@ -865,6 +938,9 @@ func main() {
 	log.Printf("  Printer: %s:%s", config.PrinterHost, config.PrinterPort)
 	log.Printf("  Printer Profile: %s", config.PrinterProfile)
 	log.Printf("  Max Image Size: %d bytes", config.MaxImageSize)
+	log.Printf("  Image Timeout: %s", config.ImageTimeout)
+	log.Printf("  MQTT Client ID: %s", config.ClientID)
+	log.Printf("  HA Discovery: %t (status every %s)", config.HADiscovery, config.StatusInterval)
 
 	// Create printer client. We don't connect here: every job opens a fresh
 	// connection, and failing hard at startup (printer asleep, network not up
@@ -879,6 +955,7 @@ func main() {
 	}
 	mqttClient.Connect()
 	defer mqttClient.Disconnect()
+	go mqttClient.runStatusPoller()
 
 	log.Println("MQTT to ESC/POS bridge is running. Press Ctrl+C to exit.")
 

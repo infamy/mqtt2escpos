@@ -328,8 +328,37 @@ The add-on can be configured through the Home Assistant UI with these options:
 | `printer_host` | `192.168.7.25` | Your printer's IP address |
 | `printer_port` | `9100` | Printer port (usually 9100 for network printers) |
 | `printer_profile` | `TM-T88VI` | Printer model profile |
-| `image_timeout` | `30` | Timeout for image processing (seconds) |
-| `max_image_size` | `1048576` | Maximum image size in bytes (1MB default) |
+| `image_timeout` | `30` | How long a job containing an image may take to send to the printer (seconds) |
+| `max_image_size` | `1048576` | Maximum size of the base64 `image` field in bytes; larger jobs are rejected |
+| `ha_discovery` | `true` | Create a "Receipt Printer" device in Home Assistant via MQTT discovery |
+| `status_interval` | `60` | How often to check the printer's status (seconds, minimum 10) |
+
+### Home Assistant device
+
+With `ha_discovery` on, the bridge creates a **Receipt Printer** device with:
+
+| Entity | What it shows |
+|--------|---------------|
+| Bridge | Whether the bridge is connected to MQTT |
+| Printer | Whether the printer is reachable on the network |
+| Paper low / Paper out / Cover open | Read from the printer with ESC/POS status queries (unknown if the printer doesn't answer them) |
+| Feed / Cut / Feed and cut | Buttons that send the matching paper command |
+
+The raw status is published (retained) to `mqtt2escpos/status` (`online`/`offline`) and `mqtt2escpos/printer` (JSON).
+
+### Not losing jobs
+
+The bridge keeps a persistent MQTT session, so the broker holds jobs sent while the bridge is restarting
+and delivers them when it reconnects. This only works for messages published with **QoS 1**, so add
+`qos: 1` to your `mqtt.publish` actions:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: printer/commands
+  qos: 1
+  payload: '{"message": "Hello"}'
+```
 
 ### How it works
 

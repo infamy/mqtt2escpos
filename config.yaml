@@ -1,6 +1,6 @@
 name: "MQTT to ESC/POS Printer Bridge"
 description: "Bridge MQTT messages to ESC/POS thermal printers for Home Assistant integration"
-version: "0.0.2"
+version: "0.0.3"
 icon: "icon.png"
 slug: "mqtt2escpos"
 arch:
@@ -24,13 +24,17 @@ options:
   printer_profile: "TM-T88VI"
   image_timeout: 30
   max_image_size: 1048576
+  ha_discovery: true
+  status_interval: 60
 schema:
   mqtt_broker: str
   mqtt_username: str
-  mqtt_password: str
+  mqtt_password: password
   mqtt_topic: str
   printer_host: str
   printer_port: str
   printer_profile: str
   image_timeout: int
-  max_image_size: int 
+  max_image_size: int
+  ha_discovery: bool
+  status_interval: "int(10,)" 
