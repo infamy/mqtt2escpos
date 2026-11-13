@@ -8,7 +8,7 @@ WORKDIR /build
 COPY app/go.mod app/go.sum ./
 RUN go mod download
 COPY app/ .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mqtt2escpos main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o mqtt2escpos .
 
 # Final stage
 FROM $BUILD_FROM
