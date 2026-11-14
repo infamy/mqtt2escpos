@@ -11,6 +11,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -202,102 +203,42 @@ func (pc *PrinterClient) Close() error {
 	return err
 }
 
-// Feed feeds paper by the specified number of lines
-func (pc *PrinterClient) Feed(lines int) error {
-	if pc.printer == nil {
-		return fmt.Errorf("printer not connected")
-	}
-
+// Feed queues a paper feed of the specified number of lines
+func (pc *PrinterClient) Feed(lines int) {
 	if lines <= 0 {
 		lines = 1 // Default to 1 line if not specified
 	}
-
 	log.Printf("Feeding paper by %d lines", lines)
-
 	for i := 0; i < lines; i++ {
 		pc.printer.LineFeed()
 	}
-
-	// Send the feed command to printer
-	if err := pc.printer.Print(); err != nil {
-		log.Printf("Error during feed: %v", err)
-		return fmt.Errorf("failed to feed paper: %v", err)
-	}
-
-	// Add delay to allow printer to process the feed command
-	time.Sleep(250 * time.Millisecond)
-
-	log.Printf("Paper feed completed successfully")
-	return nil
 }
 
-// Cut cuts the paper
-func (pc *PrinterClient) Cut() error {
-	if pc.printer == nil {
-		return fmt.Errorf("printer not connected")
-	}
-
+// Cut queues a paper cut (the printer feeds to the cutter position first)
+func (pc *PrinterClient) Cut() {
 	log.Printf("Cutting paper")
-
-	// Send cut command to printer
-	log.Printf("Sending cut command to printer...")
-	bytesWritten, err := pc.printer.Cut()
-	if err != nil {
-		log.Printf("Error during cut: %v", err)
-		return fmt.Errorf("failed to cut paper: %v", err)
-	}
-	log.Printf("Cut command sent successfully, bytes written: %d", bytesWritten)
-
-	// Flush the cut command to ensure it's sent immediately
-	if err := pc.printer.Print(); err != nil {
-		log.Printf("Error flushing cut command: %v", err)
-		return fmt.Errorf("failed to flush cut command: %v", err)
-	}
-
-	// Add delay to allow printer to process the cut command
-	time.Sleep(500 * time.Millisecond)
-
-	log.Printf("Paper cut completed successfully")
-	return nil
+	pc.printer.Cut()
 }
 
-// FeedAndCut feeds paper and then cuts it
-func (pc *PrinterClient) FeedAndCut(lines int) error {
-	if pc.printer == nil {
-		return fmt.Errorf("printer not connected")
-	}
-
-	log.Printf("Feeding and cutting paper")
-
-	// Feed the specified lines
-	if lines <= 0 {
-		lines = 1 // Default to 1 line if not specified
-	}
-
-	log.Printf("Feeding paper by %d lines", lines)
-
-	for i := 0; i < lines; i++ {
-		pc.printer.LineFeed()
-	}
-
-	// Send the feed command to printer
+// waitUntilProcessed flushes everything buffered for the printer, then sends
+// GS r 1 (transmit paper sensor status). Unlike the real-time DLE EOT queries,
+// the printer answers GS r only once it has processed all the data in front of
+// it, so the reply tells us the job is safely in the printer. Closing the
+// connection earlier can make the printer discard what it hasn't printed yet
+// (this is what used to lose images). Waits until the connection deadline.
+func (pc *PrinterClient) waitUntilProcessed() error {
+	start := time.Now()
+	pc.printer.WriteRaw([]byte{0x1D, 0x72, 0x01})
 	if err := pc.printer.Print(); err != nil {
-		log.Printf("Error during feed: %v", err)
-		return fmt.Errorf("failed to feed paper: %v", err)
+		return fmt.Errorf("failed to send data to printer: %v", err)
 	}
-
-	// Add delay to allow printer to process the feed command
-	time.Sleep(250 * time.Millisecond)
-
-	// Add delay between feed and cut
-	time.Sleep(150 * time.Millisecond)
-
-	// Then cut (which will add 5 more lines before cutting)
-	if err := pc.Cut(); err != nil {
-		return err
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(pc.conn, buf); err != nil {
+		// The data has been sent; we just can't confirm it. Don't fail the job.
+		log.Printf("Warning: printer did not confirm the job after %s: %v", time.Since(start).Round(time.Millisecond), err)
+		return nil
 	}
-
-	log.Printf("Feed and cut completed successfully")
+	log.Printf("Printer confirmed job in %s", time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -318,14 +259,16 @@ func (pc *PrinterClient) ExecuteCommand(cmd PrinterCommand) error {
 
 	switch strings.ToLower(cmd.Command) {
 	case "feed":
-		return pc.Feed(cmd.Lines)
+		pc.Feed(cmd.Lines)
 	case "cut":
-		return pc.Cut()
+		pc.Cut()
 	case "feed_and_cut":
-		return pc.FeedAndCut(cmd.Lines)
+		pc.Feed(cmd.Lines)
+		pc.Cut()
 	default:
 		return fmt.Errorf("unknown printer command: %s", cmd.Command)
 	}
+	return pc.waitUntilProcessed()
 }
 
 // resizeImage resizes an image to fit within printer limits using proper scaling
@@ -587,11 +530,8 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 				pc.printer.Write("Error: Failed to print image")
 				pc.printer.LineFeed()
 			} else {
-				log.Printf("Image printed successfully")
+				log.Printf("Image queued for printing")
 				pc.printer.LineFeed()
-
-				// Add extra delay after image printing to ensure it's fully processed
-				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	}
@@ -651,32 +591,11 @@ func (pc *PrinterClient) printJobInternal(job PrintJob) error {
 	pc.printer.Justify(escpos.JustifyLeft)
 	pc.printer.Size(1, 1)
 
-	// Send to printer (without cutting)
-	if err := pc.printer.Print(); err != nil {
+	// Send to printer (without cutting) and wait until it has taken everything
+	if err := pc.waitUntilProcessed(); err != nil {
 		log.Printf("Error during print: %v", err)
-		return fmt.Errorf("failed to send data to printer: %v", err)
+		return err
 	}
-
-	// Calculate delay based on content type and size
-	var delay time.Duration
-	if job.Image != "" {
-		// For images, calculate delay based on image data size
-		imageSize := len(job.Image)
-		if imageSize > 100000 { // Large image (>100KB)
-			delay = 1500 * time.Millisecond
-		} else if imageSize > 50000 { // Medium image (>50KB)
-			delay = 1 * time.Second
-		} else { // Small image
-			delay = 500 * time.Millisecond
-		}
-		log.Printf("Image size: %d bytes, using delay: %v", imageSize, delay)
-	} else {
-		// For text, use shorter delay
-		delay = 250 * time.Millisecond
-	}
-
-	// Add delay to allow printer to process the print job
-	time.Sleep(delay)
 
 	log.Printf("Print job completed successfully")
 	return nil
@@ -826,16 +745,6 @@ func startHealthServer(addr string, mc *MQTTClient) {
 func (mc *MQTTClient) messageHandler(client mqtt.Client, msg mqtt.Message) {
 	log.Printf("Received %d-byte message on topic %s", len(msg.Payload()), msg.Topic())
 	defer mc.requestStatusRefresh()
-
-	// Parse message to check if it contains an image
-	var tempJob PrintJob
-	if err := json.Unmarshal(msg.Payload(), &tempJob); err == nil && tempJob.Image != "" {
-		// For messages with images, use longer delay
-		time.Sleep(250 * time.Millisecond)
-	} else {
-		// For other messages, use shorter delay
-		time.Sleep(50 * time.Millisecond)
-	}
 
 	// Try to parse as a printer command first
 	var cmd PrinterCommand

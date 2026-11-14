@@ -1,6 +1,6 @@
 name: "MQTT to ESC/POS Printer Bridge"
 description: "Bridge MQTT messages to ESC/POS thermal printers for Home Assistant integration"
-version: "0.0.3"
+version: "0.0.4"
 icon: "icon.png"
 slug: "mqtt2escpos"
 arch:
